@@ -1,0 +1,5 @@
+{
+  "name": "Email Table Extractor",
+  "description": "Extract tabular data from raw emails and convert to structured CSV format with 100% accuracy.",
+  "requestFramePermissions": []
+}
