@@ -22,6 +22,15 @@ import { twMerge } from 'tailwind-merge';
 import XLSX from 'xlsx-js-style';
 import Papa from 'papaparse';
 
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -107,6 +116,15 @@ export default function App() {
   const [validation, setValidation] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [needsApiKey, setNeedsApiKey] = useState(false);
+
+  const handleSelectKey = async () => {
+    if (window.aistudio) {
+      await window.aistudio.openSelectKey();
+      setNeedsApiKey(false);
+      setError(null);
+    }
+  };
 
   const processEmail = async () => {
     if (!input.trim()) return;
@@ -115,11 +133,13 @@ export default function App() {
     setError(null);
     setTables([]);
     setValidation(null);
+    setNeedsApiKey(false);
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+      const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
+        model: "gemini-3-flash-preview",
         contents: input,
         config: {
           systemInstruction: SYSTEM_INSTRUCTION,
@@ -131,16 +151,147 @@ export default function App() {
       if (!text) throw new Error("No response from AI");
 
       // Parse the response
-      const tableMatches = text.matchAll(/Table_(\d+):\n([\s\S]*?)(?=\nTable_\d+:|\nVALIDATION:|$)/g);
+      const tableMatches = Array.from(text.matchAll(/Table_?\d*:\s*\n?([\s\S]*?)(?=\nTable_?\d*:|\nVALIDATION:|$)/gi));
       const extractedTables: ExtractedTable[] = [];
       
-      for (const match of tableMatches) {
-        extractedTables.push({
-          id: `table-${match[1]}`,
-          name: `Table ${match[1]}`,
-          csv: match[2].trim()
-        });
-      }
+      tableMatches.forEach((match, index) => {
+        const csvContent = match[1].trim();
+        if (csvContent) {
+          // Parse and filter the rows
+          const parseResult = Papa.parse<string[]>(csvContent, { header: false, skipEmptyLines: true });
+          const initialRows = parseResult.data;
+          
+          // 1. Find Part Code index in the first row
+          const header = initialRows[0] || [];
+          let partCodeIndex = -1;
+          header.forEach((cell, i) => {
+            if (cell && String(cell).toLowerCase().includes('part code')) {
+              partCodeIndex = i;
+            }
+          });
+
+          let processedRows: string[][] = [];
+          if (partCodeIndex !== -1) {
+            // 2. Insert "Subscription Details" header
+            const newHeader = [...header];
+            newHeader.splice(partCodeIndex + 1, 0, "Subscription Details");
+            processedRows.push(newHeader);
+
+            // 3. Process data rows
+            for (let i = 1; i < initialRows.length; i++) {
+              const currentRow = [...initialRows[i]];
+              
+              let subscriptionInfo = "";
+              let subIdx = -1;
+              currentRow.forEach((cell, j) => {
+                if (cell && String(cell).toLowerCase().includes('subscription')) {
+                  subscriptionInfo = String(cell);
+                  subIdx = j;
+                }
+              });
+
+              if (subscriptionInfo) {
+                // Check if it's a "subscription only" row
+                const otherContent = currentRow.filter((c, j) => j !== subIdx && c && String(c).trim() !== "");
+                if (otherContent.length === 0) {
+                  // Move to previous row
+                  if (processedRows.length > 1) {
+                    const prevRow = processedRows[processedRows.length - 1];
+                    // Ensure prevRow has enough cells
+                    while (prevRow.length <= partCodeIndex + 1) prevRow.push("");
+                    prevRow[partCodeIndex + 1] = subscriptionInfo;
+                  }
+                  continue; // Skip adding this row
+                } else {
+                  // Move within the same row
+                  currentRow.splice(partCodeIndex + 1, 0, "");
+                  const newSubIdx = subIdx > partCodeIndex ? subIdx + 1 : subIdx;
+                  currentRow[partCodeIndex + 1] = subscriptionInfo;
+                  currentRow[newSubIdx] = "";
+                  processedRows.push(currentRow);
+                }
+              } else {
+                // Normal row, just add the empty column
+                currentRow.splice(partCodeIndex + 1, 0, "");
+                processedRows.push(currentRow);
+              }
+            }
+          } else {
+            processedRows = initialRows;
+          }
+
+          // 4. Post-process for "One time price" removal and Rupee symbols
+          const tempHeader = processedRows[0] || [];
+          let otpIdx = -1;
+          let upIdx = -1;
+          let tpIdx = -1;
+          tempHeader.forEach((cell, i) => {
+            const cellText = String(cell).toLowerCase();
+            if (cellText.includes('one time price') || cellText.includes('on time price')) otpIdx = i;
+            if (cellText.includes('unit price')) upIdx = i;
+            if (cellText.includes('total price')) tpIdx = i;
+          });
+
+          const finalRows = processedRows.map((row, i) => {
+            const isHeader = i === 0;
+            const newRow = [...row];
+
+            // Add Rupee symbol to price columns (do this BEFORE splicing to keep indices correct)
+            if (!isHeader) {
+              if (upIdx !== -1 && newRow[upIdx]) {
+                const val = String(newRow[upIdx]).trim();
+                if (val && !val.startsWith('₹') && /\d/.test(val)) {
+                  newRow[upIdx] = `₹${val}`;
+                }
+              }
+              if (tpIdx !== -1 && newRow[tpIdx]) {
+                const val = String(newRow[tpIdx]).trim();
+                if (val && !val.startsWith('₹') && /\d/.test(val)) {
+                  newRow[tpIdx] = `₹${val}`;
+                }
+              }
+            }
+
+            // Identify indices to remove
+            const indicesToRemove = new Set<number>();
+            indicesToRemove.add(0); // Always remove the first column
+            if (otpIdx !== -1) {
+              indicesToRemove.add(otpIdx);
+            }
+
+            // Remove indices in descending order to maintain correct mapping
+            const sortedIndices = Array.from(indicesToRemove).sort((a, b) => b - a);
+            sortedIndices.forEach(idx => {
+              if (idx < newRow.length) {
+                newRow.splice(idx, 1);
+              }
+            });
+
+            return newRow;
+          });
+
+          // 5. Apply existing filters (empty rows, total rows)
+          const filteredRows = finalRows.filter(row => {
+            const rowText = row.join(' ').toLowerCase();
+            // Remove if empty
+            if (!row.some(cell => cell && String(cell).trim().length > 0)) {
+              return false;
+            }
+            // Remove if contains "total" but NOT "total price"
+            if (rowText.includes('total') && !rowText.includes('total price')) {
+              return false;
+            }
+            return true;
+          });
+          const filteredCsv = Papa.unparse(filteredRows);
+
+          extractedTables.push({
+            id: `table-${index + 1}`,
+            name: `Table ${index + 1}`,
+            csv: filteredCsv
+          });
+        }
+      });
 
       const validationMatch = text.match(/VALIDATION:([\s\S]*)$/);
       
@@ -152,7 +303,17 @@ export default function App() {
       }
     } catch (err) {
       console.error(err);
-      setError(err instanceof Error ? err.message : "An unexpected error occurred during processing.");
+      const errorMessage = err instanceof Error ? err.message : "An unexpected error occurred during processing.";
+      setError(errorMessage);
+      
+      if (errorMessage.toLowerCase().includes("api key not valid") || 
+          errorMessage.toLowerCase().includes("requested entity was not found") ||
+          errorMessage.toLowerCase().includes("invalid_argument") ||
+          errorMessage.toLowerCase().includes("api_key_invalid") ||
+          errorMessage.toLowerCase().includes("403") ||
+          errorMessage.toLowerCase().includes("401")) {
+        setNeedsApiKey(true);
+      }
     } finally {
       setIsProcessing(false);
     }
@@ -174,37 +335,17 @@ export default function App() {
       // Use PapaParse for robust CSV parsing
       const parseResult = Papa.parse<string[]>(table.csv, {
         header: false,
-        skipEmptyLines: false,
+        skipEmptyLines: true, // Remove empty rows from source
       });
 
       if (parseResult.data && parseResult.data.length > 0) {
-        // Add spacing between tables (approx 1 inch gap = ~6 rows)
-        if (index > 0) {
-          combinedData.push([]);
-          combinedData.push([]);
-          combinedData.push([]);
-          combinedData.push([]);
-          combinedData.push([]);
-          combinedData.push([]);
+        if (index === 0) {
+          // For the first table, add everything (headers + data)
+          combinedData.push(...parseResult.data);
+        } else {
+          // For subsequent tables, skip the header row (index 0)
+          combinedData.push(...parseResult.data.slice(1));
         }
-        
-        // Add a header row for the table name
-        combinedData.push([`--- ${table.name} ---`]);
-        
-        // Add the table data, shifting "Subscription" cells to the right
-        const processedRows = parseResult.data.map(row => {
-          const newRow = [...row];
-          // Iterate backwards to avoid shifting the same value multiple times
-          for (let i = newRow.length - 1; i >= 0; i--) {
-            if (newRow[i] && String(newRow[i]).toLowerCase().includes('subscription')) {
-              const val = newRow[i];
-              newRow[i] = ''; // Clear original
-              newRow[i + 1] = val; // Move to right
-            }
-          }
-          return newRow;
-        });
-        combinedData.push(...processedRows);
       }
     });
 
@@ -216,15 +357,15 @@ export default function App() {
       const maxRows = combinedData.length;
       ws['!cols'] = Array(maxCols).fill({ wpx: 200 });
 
-      // Set row 2 height to 36 points (index 1 is row 2)
-      if (!ws['!rows']) ws['!rows'] = [];
-      ws['!rows'][1] = { hpt: 36 };
+      // Set ALL rows height to 65 pixels
+      ws['!rows'] = Array(maxRows).fill({ hpx: 65 });
 
       // Apply styling to ALL cells
-      const lightCreamFill = { fgColor: { rgb: "FFFDD0" } };
-      const blueFill = { fgColor: { rgb: "0000FF" } };
-      const boldFont = { sz: 11, bold: true, color: { rgb: "FFFFFF" } };
-      const defaultFont = { sz: 10 };
+      const headerFill = { fgColor: { rgb: "1A365D" } }; // Deep Navy for header
+      const lightBlueFill = { fgColor: { rgb: "ADD8E6" } }; // Light Blue for alternate rows
+      const blueFill = { fgColor: { rgb: "2B5797" } }; // Blue for alternate rows
+      const baseFont = { sz: 12, bold: true, color: { rgb: "FFFFFF" } };
+      const darkBlueFont = { sz: 12, bold: true, color: { rgb: "00008B" } };
       const defaultAlignment = { horizontal: "center", vertical: "center", wrapText: true };
       const darkBlueBorder = {
         top: { style: 'thin', color: { rgb: '00008B' } },
@@ -237,47 +378,40 @@ export default function App() {
       let activeTotalPriceCols = new Set<number>();
       let activeCustomerNameCols = new Set<number>();
 
-      for (let r = 0; r < maxRows; r++) {
-        const row = combinedData[r];
-        
-        // Check if this is a table name row to update active special columns
-        if (row && row[0] && String(row[0]).startsWith('--- ') && String(row[0]).endsWith(' ---')) {
-          activeCompanyNameCols.clear();
-          activeTotalPriceCols.clear();
-          activeCustomerNameCols.clear();
-          
-          // Peek at the next row for headers
-          const headerRow = combinedData[r + 1];
-          if (headerRow) {
-            headerRow.forEach((cell, c) => {
-              const cellText = String(cell).toLowerCase();
-              if (cellText.includes('company name')) activeCompanyNameCols.add(c);
-              if (cellText.includes('total price')) activeTotalPriceCols.add(c);
-              if (cellText.includes('customer name')) activeCustomerNameCols.add(c);
-            });
-          }
-        }
+      // Identify special columns from the first row (the only header row)
+      const firstRow = combinedData[0];
+      if (firstRow) {
+        firstRow.forEach((cell, c) => {
+          const cellText = String(cell).toLowerCase();
+          if (cellText.includes('company name')) activeCompanyNameCols.add(c);
+          if (cellText.includes('total price')) activeTotalPriceCols.add(c);
+          if (cellText.includes('customer name')) activeCustomerNameCols.add(c);
+          if (cellText.includes('subscription details')) activeCustomerNameCols.add(c); // Reuse one of the sets or add a new one
+        });
+      }
 
+      for (let r = 0; r < maxRows; r++) {
         for (let c = 0; c < maxCols; c++) {
           const cellAddress = XLSX.utils.encode_cell({ r, c });
           if (!ws[cellAddress]) {
             ws[cellAddress] = { t: 's', v: '' };
           }
           
-          const isRow2 = r === 1;
-          const isSpecialCol = activeCompanyNameCols.has(c) || activeTotalPriceCols.has(c) || activeCustomerNameCols.has(c);
-          
-          // Determine font
-          let font: any = isRow2 ? { ...boldFont } : { ...defaultFont };
-          if (isSpecialCol) {
-            font.sz = 11;
-            font.bold = true;
+          const isHeader = r === 0;
+          let currentFill = headerFill;
+          let currentFont = baseFont;
+          if (!isHeader) {
+            // Alternate between Light Blue and Blue for data rows
+            // r=1 is first data row
+            const isLightBlue = r % 2 === 1;
+            currentFill = isLightBlue ? lightBlueFill : blueFill;
+            currentFont = isLightBlue ? darkBlueFont : baseFont;
           }
-
+          
           ws[cellAddress].s = {
             alignment: defaultAlignment,
-            fill: isRow2 ? blueFill : lightCreamFill,
-            font: font,
+            fill: currentFill,
+            font: { ...currentFont },
             border: darkBlueBorder
           };
         }
@@ -433,7 +567,27 @@ export default function App() {
                     <AlertCircle size={32} />
                   </div>
                   <h3 className="text-lg font-semibold text-red-600">Extraction Failed</h3>
-                  <p className="text-gray-500 text-sm max-w-xs mt-2">{error}</p>
+                  <p className="text-gray-500 text-sm max-w-xs mt-2 mb-6">{error}</p>
+                  
+                  {needsApiKey && (
+                    <div className="space-y-4 max-w-sm mx-auto p-6 bg-gray-50 rounded-2xl border border-gray-100">
+                      <p className="text-xs text-gray-600 leading-relaxed">
+                        This error usually occurs in shared apps when the developer's API key is restricted. 
+                        Please select your own Gemini API key to continue.
+                      </p>
+                      <button
+                        onClick={handleSelectKey}
+                        className="w-full py-3 bg-blue-600 text-white text-sm font-bold rounded-xl hover:bg-blue-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"
+                      >
+                        <RefreshCw size={16} />
+                        Configure API Key
+                      </button>
+                      <p className="text-[10px] text-gray-400">
+                        You'll need a key from a paid Google Cloud project. 
+                        See <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="underline hover:text-blue-500">billing docs</a>.
+                      </p>
+                    </div>
+                  )}
                 </motion.div>
               ) : tables.length > 0 ? (
                 <motion.div 
